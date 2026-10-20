@@ -10,19 +10,33 @@ async def init_db():
                 chat_id INTEGER PRIMARY KEY,
                 phone TEXT,
                 user_name TEXT,
-                search_url TEXT,
                 resume_text TEXT,
                 custom_prompt TEXT,
                 ai_key TEXT,
-                is_active INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
                 check_interval INTEGER DEFAULT 300,
                 last_check_at TIMESTAMP
             )
         """)
+        
+        # Таблица множественных поисковых фильтров
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                name TEXT,
+                url TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chat_id) REFERENCES users (chat_id)
+            )
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS vacancies (
                 vacancy_id TEXT,
                 chat_id INTEGER,
+                filter_id INTEGER,
                 title TEXT,
                 company TEXT,
                 salary TEXT,
@@ -46,8 +60,7 @@ async def get_or_create_user(chat_id: int) -> Dict[str, Any]:
             if row:
                 return dict(row)
         
-        # Создаем нового пользователя
-        await db.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
+        await db.execute("INSERT INTO users (chat_id, is_active) VALUES (?, 1)", (chat_id,))
         await db.commit()
         async with db.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)) as cursor:
             row = await cursor.fetchone()
@@ -68,15 +81,90 @@ async def update_user(chat_id: int, **kwargs):
         await db.execute(query, tuple(values))
         await db.commit()
 
-async def get_active_users() -> List[Dict[str, Any]]:
-    """Получить список пользователей с активным мониторингом."""
+# --- Управление фильтрами поиска ---
+
+async def add_filter(chat_id: int, name: str, url: str) -> int:
+    """Добавить новый фильтр поиска."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO filters (chat_id, name, url, is_active) VALUES (?, ?, ?, 1)",
+            (chat_id, name, url)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_user_filters(chat_id: int) -> List[Dict[str, Any]]:
+    """Получить все фильтры пользователя."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE is_active = 1 AND search_url IS NOT NULL AND search_url != ''"
+            "SELECT * FROM filters WHERE chat_id = ? ORDER BY id ASC", 
+            (chat_id,)
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+async def get_filter(filter_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
+    """Получить конкретный фильтр."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM filters WHERE id = ? AND chat_id = ?", 
+            (filter_id, chat_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def toggle_filter(filter_id: int, chat_id: int) -> int:
+    """Включить/выключить фильтр."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT is_active FROM filters WHERE id = ? AND chat_id = ?", 
+            (filter_id, chat_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return 0
+            new_state = 0 if row[0] else 1
+
+        await db.execute(
+            "UPDATE filters SET is_active = ? WHERE id = ? AND chat_id = ?",
+            (new_state, filter_id, chat_id)
+        )
+        await db.commit()
+        return new_state
+
+async def delete_filter(filter_id: int, chat_id: int):
+    """Удалить фильтр."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM filters WHERE id = ? AND chat_id = ?", 
+            (filter_id, chat_id)
+        )
+        await db.commit()
+
+async def get_all_active_filters_with_users() -> List[Dict[str, Any]]:
+    """Получить все активные фильтры пользователей, у которых включен глобальный мониторинг."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = """
+            SELECT 
+                f.id as filter_id,
+                f.name as filter_name,
+                f.url as search_url,
+                f.chat_id,
+                u.resume_text,
+                u.custom_prompt,
+                u.ai_key
+            FROM filters f
+            JOIN users u ON f.chat_id = u.chat_id
+            WHERE f.is_active = 1 AND u.is_active = 1
+        """
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+# --- Управление вакансиями ---
 
 async def is_vacancy_seen(vacancy_id: str, chat_id: int) -> bool:
     """Проверить, видели ли мы уже эту вакансию."""
@@ -90,6 +178,7 @@ async def is_vacancy_seen(vacancy_id: str, chat_id: int) -> bool:
 async def save_vacancy(
     vacancy_id: str,
     chat_id: int,
+    filter_id: Optional[int],
     title: str,
     company: str,
     salary: str,
@@ -101,9 +190,9 @@ async def save_vacancy(
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT OR REPLACE INTO vacancies 
-            (vacancy_id, chat_id, title, company, salary, url, description, cover_letter, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (vacancy_id, chat_id, title, company, salary, url, description, cover_letter))
+            (vacancy_id, chat_id, filter_id, title, company, salary, url, description, cover_letter, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        """, (vacancy_id, chat_id, filter_id, title, company, salary, url, description, cover_letter))
         await db.commit()
 
 async def get_vacancy(vacancy_id: str, chat_id: int) -> Optional[Dict[str, Any]]:

@@ -4,7 +4,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import database as db
-from hh_browser import search_hh_vacancies, get_vacancy_description, is_user_authenticated
+from hh_browser import search_hh_vacancies, get_vacancy_description
 from ai_letter import generate_cover_letter
 
 def get_vacancy_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
@@ -36,15 +36,18 @@ def get_vacancy_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
         ]
     )
 
-def format_vacancy_message(vacancy: dict, cover_letter: str) -> str:
-    """Форматирует красивое сообщение о вакансии для Telegram."""
+def format_vacancy_message(vacancy: dict, cover_letter: str, filter_name: Optional[str] = None) -> str:
+    """Форматирует красивое сообщение о вакансии для Telegram с указанием фильтра."""
     title = vacancy.get("title", "Не указано")
     company = vacancy.get("company", "Не указана")
     salary = vacancy.get("salary", "Не указана")
     url = vacancy.get("url", "https://hh.ru")
 
+    filter_badge = f"🎯 Фильтр: <b>{filter_name}</b>\n\n" if filter_name else ""
+
     return (
         f"🔔 <b>Новая подходящая вакансия!</b>\n\n"
+        f"{filter_badge}"
         f"💼 <b>Должность:</b> {title}\n"
         f"🏢 <b>Компания:</b> {company}\n"
         f"💰 <b>Зарплата:</b> {salary}\n"
@@ -56,10 +59,13 @@ def format_vacancy_message(vacancy: dict, cover_letter: str) -> str:
         f"<i>Нажмите «Откликнуться» для мгновенной отправки или «Редактировать», чтобы изменить текст.</i>"
     )
 
-async def check_user_vacancies(bot: Bot, user: dict):
-    """Проверяет новые вакансии для конкретного пользователя."""
-    chat_id = user["chat_id"]
-    search_url = user.get("search_url")
+async def check_single_filter(bot: Bot, item: dict):
+    """Проверяет вакансии по конкретному фильтру."""
+    chat_id = item["chat_id"]
+    filter_id = item.get("filter_id")
+    filter_name = item.get("filter_name", "Основной")
+    search_url = item.get("search_url")
+
     if not search_url:
         return
 
@@ -81,15 +87,16 @@ async def check_user_vacancies(bot: Bot, user: dict):
             # Генерируем сопроводительное письмо
             letter = await generate_cover_letter(
                 vacancy=vac,
-                resume_text=user.get("resume_text"),
-                custom_prompt=user.get("custom_prompt"),
-                user_ai_key=user.get("ai_key")
+                resume_text=item.get("resume_text"),
+                custom_prompt=item.get("custom_prompt"),
+                user_ai_key=item.get("ai_key")
             )
 
             # Сохраняем в базу данных
             await db.save_vacancy(
                 vacancy_id=vac_id,
                 chat_id=chat_id,
+                filter_id=filter_id,
                 title=vac["title"],
                 company=vac["company"],
                 salary=vac["salary"],
@@ -99,7 +106,7 @@ async def check_user_vacancies(bot: Bot, user: dict):
             )
 
             # Отправляем уведомление в Telegram с кнопками
-            text = format_vacancy_message(vac, letter)
+            text = format_vacancy_message(vac, letter, filter_name)
             kb = get_vacancy_keyboard(vac_id)
             try:
                 await bot.send_message(
@@ -114,18 +121,18 @@ async def check_user_vacancies(bot: Bot, user: dict):
                 print(f"Failed to send message to {chat_id}: {e}")
 
     except Exception as e:
-        print(f"Error checking vacancies for {chat_id}: {e}")
+        print(f"Error checking filter {filter_id} for {chat_id}: {e}")
 
 async def start_monitoring_scheduler(bot: Bot):
-    """Фоновый цикл проверки вакансий для всех активных пользователей."""
+    """Фоновый цикл проверки всех активных фильтров поиска."""
     while True:
         try:
-            active_users = await db.get_active_users()
-            for user in active_users:
-                await check_user_vacancies(bot, user)
+            active_items = await db.get_all_active_filters_with_users()
+            for item in active_items:
+                await check_single_filter(bot, item)
                 await asyncio.sleep(2)
         except Exception as e:
             print(f"Scheduler loop error: {e}")
 
-        # Пауза между итерациями (по умолчанию 60 сек, проверка каждых пользователей по очереди)
+        # Пауза между итерациями (60 сек)
         await asyncio.sleep(60)
