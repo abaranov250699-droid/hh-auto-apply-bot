@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from typing import Optional
 from aiogram import Bot, Dispatcher, F, types
@@ -77,7 +78,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "<b>Как мы работаем:</b>\n"
         "1. 🔐 <b>Подключаем ваш HH.ru</b> («🔐 Аккаунт HH.ru» или /login)\n"
         "2. 📝 <b>Указываем резюме</b> («📝 Мое резюме»)\n"
-        "3. 🎯 <b>Добавляем фильтры поиска</b> («🎯 Мои фильтры поиска» — можно добавить несколько направлений!)\n"
+        "3. 🎯 <b>Добавляем фильтры поиска</b> («🎯 Мои фильтры поиска»)\n"
         "4. 🔔 Бот в реальном времени мониторит HH и присылает новые вакансии с готовым письмом прямо на iPhone!"
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
@@ -133,8 +134,8 @@ async def cmd_login(message: types.Message, state: FSMContext):
         f"🔐 <b>Управление доступом к HH.ru</b>\n\n"
         f"Текущий статус: <b>{auth_msg}</b>\n\n"
         "Выберите удобный способ входа:\n"
-        "1. 📱 <b>По номеру телефона (SMS-код)</b> — бот запросит номер и код подтверждения.\n"
-        "2. 🔑 <b>По токену (hhtoken)</b> — если хотите войти моментально без SMS.\n"
+        "1. 📱 <b>По номеру телефона (SMS-код)</b> — нажмите кнопку ниже или просто отправьте ваш номер в чат.\n"
+        "2. 🔑 <b>По токену (hhtoken)</b> — моментальный 100% вход без SMS и капчи.\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📱 Войти по телефону (SMS)", callback_data="login_phone")],
@@ -148,18 +149,27 @@ async def cb_login_phone(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(LoginStates.waiting_for_phone)
     await callback.message.answer(
         "📱 <b>Введите ваш номер телефона</b>, привязанный к аккаунту HH.ru:\n\n"
-        "Пример: <code>+79991234567</code> или <code>9991234567</code>",
+        "Пример: <code>+79991234567</code> или <code>89991234567</code>",
         parse_mode="HTML"
     )
     await callback.answer()
 
-@dp.message(LoginStates.waiting_for_phone)
-async def process_phone(message: types.Message, state: FSMContext):
-    phone = message.text.strip()
-    wait_msg = await message.answer("⏳ Открываю безопасное соединение с HH.ru и отправляю номер телефона...")
+# Функция обработки отправки телефона со статусами в реальном времени
+async def handle_phone_submission(message: types.Message, state: FSMContext, phone: str):
+    status_msg = await message.answer("⏳ <b>Принял номер телефона!</b>\nНачинаю подключение к HH.ru...", parse_mode="HTML")
 
-    ok, resp_msg, scr_path = await start_phone_login(message.chat.id, phone)
-    await wait_msg.delete()
+    async def on_progress(step_text: str):
+        try:
+            await status_msg.edit_text(f"⏳ <b>{step_text}</b>", parse_mode="HTML")
+        except Exception:
+            pass
+
+    ok, resp_msg, scr_path = await start_phone_login(message.chat.id, phone, progress_callback=on_progress)
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     if not ok:
         if scr_path and os.path.exists(scr_path):
@@ -173,40 +183,62 @@ async def process_phone(message: types.Message, state: FSMContext):
 
     await state.set_state(LoginStates.waiting_for_code)
     await message.answer(
-        f"📩 {resp_msg}\n\n<i>Отправьте 4 цифры из SMS или Push от HeadHunter сюда в чат:</i>",
+        f"📩 <b>{resp_msg}</b>\n\n<i>Отправьте 4 цифры из SMS или Push от HeadHunter прямо сюда в чат:</i>",
         parse_mode="HTML"
     )
+
+# Обработчик, если пользователь находится в состоянии ожидания телефона
+@dp.message(LoginStates.waiting_for_phone)
+async def process_phone_state(message: types.Message, state: FSMContext):
+    await handle_phone_submission(message, state, message.text.strip())
+
+# АВТО-ОПРЕДЕЛЕНИЕ НОМЕРА ТЕЛЕФОНА (даже если пользователь не нажимал кнопку "Войти")
+@dp.message(F.text.regexp(r'^(\+7|7|8)?[\s\-]?\(?[489][0-9]{2}\)?[\s\-]?[0-9]{3}[\s\-]?[0-9]{2}[\s\-]?[0-9]{2}$'))
+async def auto_detect_phone(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    # Если мы уже ждем код или что-то другое, не перехватываем
+    if current_state == LoginStates.waiting_for_code.state:
+        return
+    await handle_phone_submission(message, state, message.text.strip())
 
 @dp.message(LoginStates.waiting_for_code)
 async def process_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
-    wait_msg = await message.answer("⏳ Проверяю код подтверждения...")
+    wait_msg = await message.answer("⏳ <b>Проверяю код подтверждения...</b>", parse_mode="HTML")
 
     ok, resp_msg = await submit_otp_code(message.chat.id, code)
-    await wait_msg.delete()
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
 
     if ok:
         await state.clear()
-        await message.answer(f"🎉 {resp_msg}", reply_markup=get_main_keyboard())
+        await message.answer(f"🎉 <b>{resp_msg}</b>", reply_markup=get_main_keyboard(), parse_mode="HTML")
     else:
         await message.answer(f"❌ {resp_msg}\nПопробуйте ввести код еще раз:")
 
 @dp.callback_query(F.data == "login_cookie")
 async def cb_login_cookie(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(CookieStates.waiting_for_token)
-    await callback.message.answer(
-        "🔑 <b>Вход по hhtoken</b>\n\n"
-        "Отправьте значение куки <code>hhtoken</code> из браузера:",
-        parse_mode="HTML"
+    info_text = (
+        "🔑 <b>Моментальный вход по токену (100% без капчи и SMS)</b>\n\n"
+        "1. Откройте [hh.ru](https://hh.ru) на компьютере в браузере (где вы уже авторизованы).\n"
+        "2. Нажмите <b>F12</b> ➔ перейдите во вкладку <b>Application</b> (Приложение) ➔ <b>Cookies</b> ➔ <code>https://hh.ru</code>.\n"
+        "3. Скопируйте значение строки <code>hhtoken</code> и пришлите сюда в чат!"
     )
+    await callback.message.answer(info_text, parse_mode="HTML", disable_web_page_preview=True)
     await callback.answer()
 
 @dp.message(CookieStates.waiting_for_token)
 async def process_token(message: types.Message, state: FSMContext):
     token = message.text.strip()
-    wait_msg = await message.answer("⏳ Проверяю токен...")
+    wait_msg = await message.answer("⏳ <b>Проверяю токен...</b>", parse_mode="HTML")
     ok, resp_msg = await save_cookie_login(message.chat.id, token)
-    await wait_msg.delete()
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
 
     if ok:
         await state.clear()
@@ -448,7 +480,7 @@ async def cmd_check_now(message: types.Message):
         await message.answer("⚠️ У вас нет активных фильтров поиска. Добавьте их в «🎯 Мои фильтры поиска».")
         return
 
-    wait_msg = await message.answer(f"🔎 Проверяю {len(active_filters)} активных фильтров на HH.ru...")
+    wait_msg = await message.answer(f"🔎 <b>Проверяю {len(active_filters)} активных фильтров на HH.ru...</b>", parse_mode="HTML")
     user = await db.get_or_create_user(message.chat.id)
     for f in active_filters:
         item = {
@@ -462,7 +494,10 @@ async def cmd_check_now(message: types.Message):
         }
         await check_single_filter(bot, item)
     
-    await wait_msg.delete()
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
     await message.answer("🏁 Проверка завершена! Если появились новые вакансии, они отправлены выше.")
 
 # --- Кнопка "Откликнуться" под вакансией ---
@@ -482,7 +517,10 @@ async def cb_apply_vacancy(callback: types.CallbackQuery):
     status_msg = await callback.message.reply("⏳ <b>Отправляю отклик на HH.ru...</b>", parse_mode="HTML")
 
     ok, result_msg, scr_path = await apply_to_hh_vacancy(chat_id, vacancy_id, letter)
-    await status_msg.delete()
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     if ok:
         await db.update_vacancy(vacancy_id, chat_id, status="applied")
@@ -574,7 +612,7 @@ async def process_rewrite_instruction(message: types.Message, state: FSMContext)
         await state.clear()
         return
 
-    wait_msg = await message.answer("🤖 AI переписывает сопроводительное письмо...")
+    wait_msg = await message.answer("🤖 <b>AI переписывает сопроводительное письмо...</b>", parse_mode="HTML")
 
     user = await db.get_or_create_user(message.chat.id)
     new_letter = await rewrite_cover_letter(
@@ -582,7 +620,10 @@ async def process_rewrite_instruction(message: types.Message, state: FSMContext)
         instruction=instruction,
         user_ai_key=user.get("ai_key")
     )
-    await wait_msg.delete()
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
 
     await db.update_vacancy(vacancy_id, message.chat.id, cover_letter=new_letter)
     await state.clear()
@@ -616,3 +657,11 @@ async def cb_skip_vacancy(callback: types.CallbackQuery):
         reply_markup=None
     )
     await callback.answer("Пропущено")
+
+# --- Универсальный ответ на любые непонятные сообщения ---
+@dp.message()
+async def fallback_handler(message: types.Message):
+    await message.answer(
+        "👋 Я на связи! Выберите нужное действие с помощью кнопок меню внизу:",
+        reply_markup=get_main_keyboard()
+    )
