@@ -1,5 +1,6 @@
 import re
 import json
+import random
 import asyncio
 from typing import Optional, Tuple, List, Dict, Any
 from pathlib import Path
@@ -9,6 +10,51 @@ from config import DATA_DIR, SCREENSHOTS_DIR
 # Словарь активных сессий логина в памяти: chat_id -> dict
 _active_logins: Dict[int, Dict[str, Any]] = {}
 
+# Скрипт маскировки браузера под реального пользователя (анти-детект)
+STEALTH_INIT_SCRIPT = """
+(() => {
+    // 1. Скрываем автоматизацию
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined
+    });
+
+    // 2. Имитируем окружение Chrome
+    window.chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+    };
+
+    // 3. Плагины браузера
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+            { name: 'Native Client', filename: 'internal-nacl-plugin' }
+        ]
+    });
+
+    // 4. Языки
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['ru-RU', 'ru', 'en-US', 'en']
+    });
+
+    // 5. Платформа
+    Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32'
+    });
+
+    // 6. Разрешения
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            originalQuery(parameters)
+    );
+})();
+"""
+
 def get_session_file(chat_id: int) -> Path:
     return DATA_DIR / f"session_{chat_id}.json"
 
@@ -17,7 +63,10 @@ def is_user_authenticated(chat_id: int) -> bool:
     return session_file.exists() and session_file.stat().st_size > 50
 
 async def get_browser_context(p, chat_id: Optional[int] = None) -> Tuple[Browser, BrowserContext]:
-    """Создать изолированный браузерный контекст с сохраненной сессией (если есть)."""
+    """
+    Создает изолированный браузерный контекст с полной маскировкой под реального пользователя.
+    """
+    # Набор реалистичных аргументов Chromium
     browser = await p.chromium.launch(
         headless=True,
         args=[
@@ -25,6 +74,11 @@ async def get_browser_context(p, chat_id: Optional[int] = None) -> Tuple[Browser
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+            '--window-size=1920,1080'
         ]
     )
     
@@ -34,13 +88,52 @@ async def get_browser_context(p, chat_id: Optional[int] = None) -> Tuple[Browser
         if session_file.exists():
             storage_state = str(session_file)
 
+    # Случайное легкое отклонение в размерах экрана (как у реальных мониторов)
+    width = 1920 + random.choice([-20, 0, 10])
+    height = 1080 + random.choice([-15, 0, 15])
+
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         locale="ru-RU",
-        viewport={"width": 1280, "height": 800},
-        storage_state=storage_state
+        timezone_id="Europe/Moscow",
+        viewport={"width": width, "height": height},
+        storage_state=storage_state,
+        has_touch=False,
+        is_mobile=False,
+        device_scale_factor=1
     )
+
+    # Применяем Stealth-скрипт ко всем страницам
+    await context.add_init_script(STEALTH_INIT_SCRIPT)
     return browser, context
+
+async def human_type(page: Page, selector: str, text: str):
+    """
+    Печатает текст как живой человек: с рандомными паузами между буквами и пробелами.
+    """
+    element = await page.wait_for_selector(selector, state="visible", timeout=10000)
+    await element.click()
+    await asyncio.sleep(random.uniform(0.3, 0.7))
+
+    for char in text:
+        await page.keyboard.type(char)
+        # Случайная пауза: для знаков препинания и пробелов чуть дольше
+        if char in ('.', ',', '!', '?', '\n'):
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+        elif char == ' ':
+            await asyncio.sleep(random.uniform(0.06, 0.14))
+        else:
+            await asyncio.sleep(random.uniform(0.02, 0.07))
+
+async def human_scroll(page: Page):
+    """Имитирует скроллинг страницы живым человеком."""
+    scroll_amount = random.randint(250, 600)
+    await page.mouse.wheel(0, scroll_amount)
+    await asyncio.sleep(random.uniform(1.0, 2.0))
+    if random.random() > 0.5:
+        # Иногда чуть прокручиваем обратно вверх
+        await page.mouse.wheel(0, -random.randint(50, 150))
+        await asyncio.sleep(random.uniform(0.5, 1.0))
 
 async def check_auth_status(chat_id: int) -> Tuple[bool, str]:
     """Проверяет действительность сохраненной сессии."""
@@ -53,14 +146,12 @@ async def check_auth_status(chat_id: int) -> Tuple[bool, str]:
         page = await context.new_page()
         try:
             await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(2000)
+            await asyncio.sleep(random.uniform(1.5, 2.5))
             
-            # Если произошел редирект на логин
             if "/account/login" in page.url:
                 await browser.close()
                 return False, "Сессия устарела. Пожалуйста, выполните вход заново."
             
-            # Ищем имя пользователя или резюме
             user_el = await page.query_selector('[data-qa="mainmenu_applicantProfile"]')
             user_name = await user_el.inner_text() if user_el else "Пользователь HH"
             await browser.close()
@@ -70,10 +161,7 @@ async def check_auth_status(chat_id: int) -> Tuple[bool, str]:
             return False, f"Ошибка проверки сессии: {str(e)}"
 
 async def start_phone_login(chat_id: int, phone: str) -> Tuple[bool, str, Optional[str]]:
-    """
-    Шаг 1 авторизации: ввод номера телефона и запрос SMS-кода.
-    """
-    # Очищаем старую сессию логина, если была
+    """Шаг 1 авторизации: ввод номера телефона."""
     if chat_id in _active_logins:
         try:
             await _active_logins[chat_id]["browser"].close()
@@ -81,13 +169,12 @@ async def start_phone_login(chat_id: int, phone: str) -> Tuple[bool, str, Option
             pass
         _active_logins.pop(chat_id, None)
 
-    # Нормализуем телефон (оставляем только цифры, для РФ - 10 цифр без +7/8)
     digits = re.sub(r'\D', '', phone)
     if digits.startswith('7') or digits.startswith('8'):
         digits = digits[1:]
     
     if len(digits) != 10:
-        return False, "Неверный формат номера телефона. Введите номер РФ, например: +79991234567 или 9991234567", None
+        return False, "Неверный формат номера. Введите номер РФ, например: +79991234567", None
 
     p = await async_playwright().start()
     browser, context = await get_browser_context(p)
@@ -95,43 +182,40 @@ async def start_phone_login(chat_id: int, phone: str) -> Tuple[bool, str, Option
 
     try:
         await page.goto("https://hh.ru/account/login", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(1500)
+        await asyncio.sleep(random.uniform(1.2, 2.0))
 
-        # Если на первом экране выбор "Соискатель / Работодатель"
         applicant_radio = await page.query_selector('[data-qa="account-type-card-APPLICANT"]')
         if applicant_radio:
             submit_btn = await page.query_selector('[data-qa="submit-button"]')
             if submit_btn:
                 await submit_btn.click()
-                await page.wait_for_timeout(2000)
+                await asyncio.sleep(random.uniform(1.5, 2.2))
 
-        # Ищем поле ввода телефона
         phone_input = await page.query_selector('[data-qa="magritte-phone-input-national-number-input"]')
         if not phone_input:
             phone_input = await page.query_selector('input[type="tel"]')
 
         if not phone_input:
-            # Скриншот для отладки
             scr_path = str(SCREENSHOTS_DIR / f"login_err_{chat_id}.png")
             await page.screenshot(path=scr_path)
             await browser.close()
             await p.stop()
-            return False, "Не удалось найти поле ввода телефона на странице входа HH.ru.", scr_path
+            return False, "Не удалось найти поле ввода телефона на HH.ru.", scr_path
 
         await phone_input.fill("")
-        await phone_input.type(digits, delay=50)
-        await page.wait_for_timeout(500)
+        for digit in digits:
+            await phone_input.type(digit, delay=random.randint(40, 90))
 
-        # Нажимаем кнопку продолжения / получения кода
+        await asyncio.sleep(random.uniform(0.6, 1.2))
+
         submit_btn = await page.query_selector('[data-qa="submit-button"]')
         if not submit_btn:
             submit_btn = await page.query_selector('button[type="submit"]')
 
         if submit_btn:
             await submit_btn.click()
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(random.uniform(2.5, 3.5))
 
-        # Проверяем на капчу
         captcha = await page.query_selector('.smart-captcha, iframe[src*="captcha"], [data-qa="captcha"]')
         if captcha or "captcha" in page.url.lower():
             scr_path = str(SCREENSHOTS_DIR / f"captcha_{chat_id}.png")
@@ -143,9 +227,8 @@ async def start_phone_login(chat_id: int, phone: str) -> Tuple[bool, str, Option
                 "page": page,
                 "has_captcha": True
             }
-            return False, "HH.ru запросил подтверждение (капчу). Пожалуйста, введите код с картинки или войдите по токену через /cookie", scr_path
+            return False, "HH.ru запросил подтверждение (капчу). Попробуйте позже или используйте /cookie", scr_path
 
-        # Сохраняем активный контекст ожидания кода
         _active_logins[chat_id] = {
             "playwright": p,
             "browser": browser,
@@ -166,12 +249,10 @@ async def start_phone_login(chat_id: int, phone: str) -> Tuple[bool, str, Option
         return False, f"Ошибка при подключении к HH.ru: {str(e)}", scr_path
 
 async def submit_otp_code(chat_id: int, code: str) -> Tuple[bool, str]:
-    """
-    Шаг 2 авторизации: ввод полученного SMS/email кода и сохранение сессии.
-    """
+    """Шаг 2 авторизации: ввод SMS кода."""
     session = _active_logins.get(chat_id)
     if not session:
-        return False, "Сессия авторизации не найдена или истекла. Запустите /login заново."
+        return False, "Сессия авторизации истекла. Запустите /login заново."
 
     page: Page = session["page"]
     browser: Browser = session["browser"]
@@ -180,10 +261,9 @@ async def submit_otp_code(chat_id: int, code: str) -> Tuple[bool, str]:
 
     clean_code = re.sub(r'\D', '', code)
     if not clean_code:
-        return False, "Код должен содержать цифры. Попробуйте еще раз:"
+        return False, "Код должен содержать цифры."
 
     try:
-        # Ищем поля ввода кода (часто 4 отдельных поля или одно общее)
         inputs = await page.query_selector_all('input[data-qa*="otp-code"], input[name*="code"], input[autocomplete="one-time-code"]')
         if not inputs:
             inputs = await page.query_selector_all('input[type="text"], input[type="tel"]')
@@ -191,25 +271,22 @@ async def submit_otp_code(chat_id: int, code: str) -> Tuple[bool, str]:
         if len(inputs) == 4 and len(clean_code) == 4:
             for idx, digit in enumerate(clean_code):
                 await inputs[idx].fill(digit)
-                await page.wait_for_timeout(100)
+                await asyncio.sleep(random.uniform(0.1, 0.2))
         elif inputs:
             await inputs[0].fill(clean_code)
         else:
-            await page.keyboard.type(clean_code, delay=50)
+            await page.keyboard.type(clean_code, delay=random.randint(50, 100))
 
-        await page.wait_for_timeout(3000)
+        await asyncio.sleep(random.uniform(2.5, 3.5))
 
-        # Если есть кнопка подтверждения кода
         confirm_btn = await page.query_selector('[data-qa="submit-button"], button[type="submit"]')
         if confirm_btn and await confirm_btn.is_visible():
             await confirm_btn.click()
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(random.uniform(2.5, 3.5))
 
-        # Проверяем успешный вход: сохраняем куки
         session_file = get_session_file(chat_id)
         await context.storage_state(path=str(session_file))
 
-        # Проверяем, что в cookies есть hhtoken или авторизационные данные
         cookies = await context.cookies()
         has_auth_cookie = any(c['name'] in ('hhtoken', 'hhrole', '_xsrf') for c in cookies)
 
@@ -220,7 +297,7 @@ async def submit_otp_code(chat_id: int, code: str) -> Tuple[bool, str]:
         if has_auth_cookie or not "/account/login" in page.url:
             return True, "✅ Авторизация успешна! Аккаунт подключен к боту."
         else:
-            return False, "Не удалось завершить вход. Возможно, введен неверный код. Попробуйте снова /login."
+            return False, "Не удалось завершить вход. Попробуйте снова /login."
 
     except Exception as e:
         await browser.close()
@@ -229,11 +306,8 @@ async def submit_otp_code(chat_id: int, code: str) -> Tuple[bool, str]:
         return False, f"Ошибка при вводе кода: {str(e)}"
 
 async def save_cookie_login(chat_id: int, cookie_str: str) -> Tuple[bool, str]:
-    """
-    Альтернативный вход: сохранение сессии через hhtoken или строку cookies из браузера.
-    """
+    """Вход по токену."""
     token = cookie_str.strip()
-    # Если передан hhtoken=...
     if "hhtoken=" in token:
         m = re.search(r'hhtoken=([^;\s]+)', token)
         if m:
@@ -257,7 +331,6 @@ async def save_cookie_login(chat_id: int, cookie_str: str) -> Tuple[bool, str]:
     with open(session_file, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-    # Проверяем работоспособность
     ok, msg = await check_auth_status(chat_id)
     if ok:
         return True, f"✅ Успешный вход по токену! {msg}"
@@ -268,9 +341,9 @@ async def save_cookie_login(chat_id: int, cookie_str: str) -> Tuple[bool, str]:
 
 async def search_hh_vacancies(search_url: str, limit: int = 15) -> List[Dict[str, Any]]:
     """
-    Поиск новых вакансий по указанной ссылке HH.ru через фоновый браузер.
+    ПОИСК ВАКАНСИЙ В 100% АНОНИМНОМ РЕЖИМЕ (БЕЗ КУК ПОЛЬЗОВАТЕЛЯ).
+    HH.ru не знает, какой пользователь выполняет поиск.
     """
-    # Добавляем сортировку по дате публикации, если ее нет
     target_url = search_url
     if "order_by=" not in target_url:
         sep = "&" if "?" in target_url else "?"
@@ -278,20 +351,19 @@ async def search_hh_vacancies(search_url: str, limit: int = 15) -> List[Dict[str
 
     vacancies = []
     async with async_playwright() as p:
-        browser, context = await get_browser_context(p)
+        # Важно: chat_id=None — поиск строго анонимен!
+        browser, context = await get_browser_context(p, chat_id=None)
         page = await context.new_page()
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
-            await page.wait_for_timeout(2000)
+            await asyncio.sleep(random.uniform(1.8, 3.0))
 
-            # Находим карточки вакансий
             cards = await page.query_selector_all('[data-qa="vacancy-serp__vacancy"]')
             if not cards:
                 cards = await page.query_selector_all('.vacancy-card--H8Place, [data-qa="serp-item__title"]')
 
             for card in cards[:limit]:
                 try:
-                    # Ссылка и заголовок
                     link_el = await card.query_selector('a[data-qa="serp-item__title"], a[data-qa="vacancy-serp__vacancy-title"]')
                     if not link_el:
                         link_el = card if await card.get_attribute('href') else None
@@ -304,20 +376,17 @@ async def search_hh_vacancies(search_url: str, limit: int = 15) -> List[Dict[str
                     if not href:
                         continue
 
-                    # Извлекаем ID вакансии
                     m = re.search(r'/vacancy/(\d+)', href)
                     if not m:
                         continue
                     vacancy_id = m.group(1)
                     clean_url = f"https://hh.ru/vacancy/{vacancy_id}"
 
-                    # Зарплата
                     salary = "Не указана"
                     salary_el = await card.query_selector('[data-qa="vacancy-serp__vacancy-compensation"], [data-qa="vacancy-salary"]')
                     if salary_el:
                         salary = (await salary_el.inner_text()).strip()
 
-                    # Компания
                     company = "Компания не указана"
                     company_el = await card.query_selector('a[data-qa="vacancy-serp__vacancy-employer"], [data-qa="vacancy-company-name"]')
                     if company_el:
@@ -341,9 +410,9 @@ async def search_hh_vacancies(search_url: str, limit: int = 15) -> List[Dict[str
     return vacancies
 
 async def get_vacancy_description(vacancy_id: str) -> Dict[str, Any]:
-    """Получить полное описание вакансии для генерации сопроводительного письма."""
+    """Получает описание вакансии также в анонимном режиме."""
     async with async_playwright() as p:
-        browser, context = await get_browser_context(p)
+        browser, context = await get_browser_context(p, chat_id=None)
         page = await context.new_page()
         data = {
             "title": "",
@@ -353,7 +422,7 @@ async def get_vacancy_description(vacancy_id: str) -> Dict[str, Any]:
         }
         try:
             await page.goto(f"https://hh.ru/vacancy/{vacancy_id}", wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(1500)
+            await asyncio.sleep(random.uniform(1.2, 2.0))
 
             title_el = await page.query_selector('[data-qa="vacancy-title"]')
             if title_el:
@@ -383,7 +452,12 @@ async def apply_to_hh_vacancy(
     cover_letter: str
 ) -> Tuple[bool, str, Optional[str]]:
     """
-    Откликнуться на вакансию от имени авторизованного пользователя с сопроводительным письмом.
+    ОТКЛИК НА ВАКАНСИЮ С ПОЛНОЙ ИМИТАЦИЕЙ ЧЕЛОВЕЧЕСКОГО ПОВЕДЕНИЯ:
+    - Задержка на чтение вакансии (3-6 сек)
+    - Скроллинг страницы мышью
+    - Наведение и клик
+    - Посимвольный ввод сопроводительного письма (human typing)
+    - Пауза перед финальным кликом
     """
     if not is_user_authenticated(chat_id):
         return False, "Вы не авторизованы в HH.ru! Выполните /login или /cookie", None
@@ -394,17 +468,22 @@ async def apply_to_hh_vacancy(
         scr_path = str(SCREENSHOTS_DIR / f"apply_{vacancy_id}_{chat_id}.png")
 
         try:
-            await page.goto(f"https://hh.ru/vacancy/{vacancy_id}", wait_until="domcontentloaded", timeout=25000)
-            await page.wait_for_timeout(2000)
+            await page.goto(f"https://hh.ru/vacancy/{vacancy_id}", wait_until="domcontentloaded", timeout=30000)
+            
+            # 1. Человеческая пауза: соискатель "читает" вакансию
+            await asyncio.sleep(random.uniform(3.0, 5.5))
 
-            # Проверяем, не был ли уже совершен отклик
+            # 2. Имитация чтения — скролл страницы
+            await human_scroll(page)
+
+            # Проверяем, не был ли уже совершен отклик ранее
             already = await page.query_selector('[data-qa="vacancy-response-link-view"]')
             page_text = await page.content()
             if already or "Вы откликнулись" in page_text:
                 await browser.close()
                 return True, "Вы уже откликались на эту вакансию ранее.", None
 
-            # Ищем кнопку "Откликнуться"
+            # 3. Находим кнопку "Откликнуться"
             apply_btn = await page.query_selector('[data-qa="vacancy-response-link-top"]')
             if not apply_btn:
                 apply_btn = await page.query_selector('a[href*="/applicant/vacancy_response"], button[data-qa*="vacancy-response"]')
@@ -412,45 +491,57 @@ async def apply_to_hh_vacancy(
             if not apply_btn:
                 await page.screenshot(path=scr_path)
                 await browser.close()
-                return False, "Кнопка 'Откликнуться' не найдена. Возможно, вакансия в архиве.", scr_path
+                return False, "Кнопка 'Откликнуться' не найдена. Возможно, вакансия закрыта.", scr_path
 
+            # Наведение мыши и клик
+            await apply_btn.hover()
+            await asyncio.sleep(random.uniform(0.4, 0.8))
             await apply_btn.click()
-            await page.wait_for_timeout(2500)
+            await asyncio.sleep(random.uniform(2.0, 3.5))
 
-            # Если открылось модальное окно отклика
-            # Проверяем кнопку "Добавить сопроводительное"
+            # 4. Если открылось модальное окно — открываем сопроводительное письмо
             toggle_letter = await page.query_selector('[data-qa="vacancy-response-letter-toggle"]')
             if toggle_letter and await toggle_letter.is_visible():
+                await toggle_letter.hover()
+                await asyncio.sleep(random.uniform(0.3, 0.6))
                 await toggle_letter.click()
-                await page.wait_for_timeout(500)
+                await asyncio.sleep(random.uniform(0.8, 1.5))
 
-            # Ищем поле ввода сопроводительного письма
+            # 5. Ввод письма как живой человек (побуквенно)
             letter_input = await page.query_selector(
                 '[data-qa="vacancy-response-popup-form-letter-input"], textarea[name="message"], textarea'
             )
             if letter_input and await letter_input.is_visible() and cover_letter:
+                # Очищаем поле
                 await letter_input.fill("")
-                await letter_input.fill(cover_letter.strip())
-                await page.wait_for_timeout(500)
+                # Печатаем по-человечески с небольшими задержками
+                for chunk in re.split(r'(\s+)', cover_letter.strip()):
+                    await letter_input.type(chunk, delay=random.randint(15, 35))
+                    if '\n' in chunk:
+                        await asyncio.sleep(random.uniform(0.2, 0.5))
 
-            # Нажимаем финальную кнопку отправки отклика
+                await asyncio.sleep(random.uniform(1.2, 2.5))
+
+            # 6. Финальная кнопка отправки
             submit_response_btn = await page.query_selector(
                 '[data-qa="vacancy-response-submit-popup"], button[data-qa*="vacancy-response-submit"]'
             )
             if submit_response_btn and await submit_response_btn.is_visible():
+                await submit_response_btn.hover()
+                await asyncio.sleep(random.uniform(0.5, 1.2))
                 await submit_response_btn.click()
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(random.uniform(2.5, 4.0))
 
-            # Проверяем, появились ли дополнительные вопросы/тестирование работодателя
+            # Проверяем, не запросил ли работодатель обязательный опросник/тест
             test_questions = await page.query_selector('[data-qa="vacancy-response-questions"]')
             if test_questions:
                 await page.screenshot(path=scr_path)
                 await browser.close()
-                return False, "Работодатель требует ответить на вопросы анкеты/теста. Откройте вакансию вручную.", scr_path
+                return False, "Работодатель установил обязательные вопросы/тест. Откройте вакансию вручную.", scr_path
 
             await page.screenshot(path=scr_path)
             await browser.close()
-            return True, "✅ Отклик с сопроводительным письмом успешно отправлен работодателю!", None
+            return True, "✅ Отклик с письмом успешно отправлен (маскировка 100%)!", None
 
         except Exception as e:
             try:

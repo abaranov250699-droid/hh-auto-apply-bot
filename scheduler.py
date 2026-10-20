@@ -1,3 +1,4 @@
+import random
 import asyncio
 from typing import Optional
 from aiogram import Bot
@@ -37,7 +38,7 @@ def get_vacancy_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
     )
 
 def format_vacancy_message(vacancy: dict, cover_letter: str, filter_name: Optional[str] = None) -> str:
-    """Форматирует красивое сообщение о вакансии для Telegram с указанием фильтра."""
+    """Форматирует сообщение о вакансии для Telegram."""
     title = vacancy.get("title", "Не указано")
     company = vacancy.get("company", "Не указана")
     salary = vacancy.get("salary", "Не указана")
@@ -60,7 +61,7 @@ def format_vacancy_message(vacancy: dict, cover_letter: str, filter_name: Option
     )
 
 async def check_single_filter(bot: Bot, item: dict):
-    """Проверяет вакансии по конкретному фильтру."""
+    """Проверяет вакансии по конкретному фильтру в безопасном анонимном режиме."""
     chat_id = item["chat_id"]
     filter_id = item.get("filter_id")
     filter_name = item.get("filter_name", "Основной")
@@ -76,7 +77,7 @@ async def check_single_filter(bot: Bot, item: dict):
             if await db.is_vacancy_seen(vac_id, chat_id):
                 continue
 
-            # Получаем подробное описание для качественного письма
+            # Получаем подробное описание в анонимном режиме
             details = await get_vacancy_description(vac_id)
             vac["description"] = details.get("description", "")
             if not vac.get("title") and details.get("title"):
@@ -116,7 +117,7 @@ async def check_single_filter(bot: Bot, item: dict):
                     parse_mode="HTML",
                     disable_web_page_preview=False
                 )
-                await asyncio.sleep(1)  # Защита от лимитов Telegram
+                await asyncio.sleep(1.5)
             except Exception as e:
                 print(f"Failed to send message to {chat_id}: {e}")
 
@@ -124,15 +125,20 @@ async def check_single_filter(bot: Bot, item: dict):
         print(f"Error checking filter {filter_id} for {chat_id}: {e}")
 
 async def start_monitoring_scheduler(bot: Bot):
-    """Фоновый цикл проверки всех активных фильтров поиска."""
+    """
+    Фоновый цикл проверки всех активных фильтров поиска.
+    Использует динамический джиттер (случайные паузы), чтобы исключить шаблонность запросов.
+    """
     while True:
         try:
             active_items = await db.get_all_active_filters_with_users()
             for item in active_items:
                 await check_single_filter(bot, item)
-                await asyncio.sleep(2)
+                # Случайная пауза между проверками разных фильтров
+                await asyncio.sleep(random.uniform(2.0, 5.0))
         except Exception as e:
             print(f"Scheduler loop error: {e}")
 
-        # Пауза между итерациями (60 сек)
-        await asyncio.sleep(60)
+        # Случайный интервал между полными циклами проверки (джиттер от 60 до 110 секунд)
+        delay = random.uniform(60.0, 110.0)
+        await asyncio.sleep(delay)
