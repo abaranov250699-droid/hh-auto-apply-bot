@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: hh-auto-apply-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    envVars:
+      - key: BOT_TOKEN
+        value: 8688226659:AAFhIVbsq4gTwe3EGq_KBVfs5WM4CJYw_Wo
+      - key: GEMINI_API_KEY
+        sync: false
